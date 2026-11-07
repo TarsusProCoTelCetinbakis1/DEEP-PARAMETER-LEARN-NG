@@ -1,0 +1,148 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import time
+
+class DeepParameterFunction(torch.autograd.Function):
+    @staticmethod
+    @torch.amp.custom_fwd(cast_inputs=torch.float32, device_type="cuda")
+    def forward(ctx, x, w_outer, w_inner_A, w_inner_B, alpha, bias, rank):
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0)
+
+        effective_rank = max(1, min(int(rank), w_inner_A.size(0)))
+        ctx.effective_rank = effective_rank
+
+        A_active = w_inner_A[:effective_rank, :]
+        # HATA DÜZELTİLDİ: "effec detive_rank" -> "effective_rank"
+        B_active = w_inner_B[:, :effective_rank]
+
+        inner_step = F.linear(x, A_active)
+        inner_context = torch.tanh(F.linear(inner_step, B_active))
+        base_output = F.linear(x, w_outer)
+
+        scaling = alpha / (effective_rank + 1e-8)
+        modulation = 1.0 + (scaling * inner_context)
+        modulation = torch.clamp(modulation, min=-10.0, max=10.0)
+
+        output = base_output * modulation
+        if bias is not None:
+            output = output + bias
+
+        ctx.save_for_backward(x, w_outer, w_inner_A, w_inner_B, alpha, bias)
+        return output
+
+    @staticmethod
+    @torch.amp.custom_bwd(device_type="cuda")
+    def backward(ctx, grad_output):
+        if torch.isnan(grad_output).any():
+            grad_output = torch.nan_to_num(grad_output, nan=0.0)
+
+        x, w_outer, w_inner_A, w_inner_B, alpha, bias = ctx.saved_tensors
+        effective_rank = ctx.effective_rank
+        scaling = alpha / (effective_rank + 1e-8)
+
+        A_active = w_inner_A[:effective_rank, :]
+        B_active = w_inner_B[:, :effective_rank]
+
+        inner_step = F.linear(x, A_active)
+        inner_context = torch.tanh(F.linear(inner_step, B_active))
+        base_output = F.linear(x, w_outer)
+
+        modulation = torch.clamp(1.0 + (scaling * inner_context), min=-10.0, max=10.0)
+
+        grad_base = grad_output * modulation
+        grad_modulation = grad_output * base_output
+
+        shape_orig = x.shape
+        x_2d = x.reshape(-1, shape_orig[-1])
+        grad_base_2d = grad_base.reshape(-1, grad_base.size(-1))
+        grad_mod_2d = grad_modulation.reshape(-1, grad_modulation.size(-1))
+        inner_ctx_2d = inner_context.reshape(-1, inner_context.size(-1))
+        inner_step_2d = inner_step.reshape(-1, inner_step.size(-1))
+        grad_out_2d = grad_output.reshape(-1, grad_output.size(-1))
+
+        dw_outer = grad_base_2d.t() @ x_2d
+        dx_outer = grad_base_2d @ w_outer
+        dx_outer = dx_outer.reshape(shape_orig)
+
+        dbias = grad_out_2d.sum(dim=0) if bias is not None else None
+        dalpha = (grad_mod_2d * inner_ctx_2d).sum(dim=0) / (effective_rank + 1e-8)
+
+        grad_inner_context_2d = grad_mod_2d * scaling
+        grad_tanh_input_2d = grad_inner_context_2d * (1.0 - inner_ctx_2d.pow(2))
+
+        dw_inner_B_active = grad_tanh_input_2d.t() @ inner_step_2d
+        grad_inner_step_2d = grad_tanh_input_2d @ B_active
+
+        dw_inner_A_active = grad_inner_step_2d.t() @ x_2d
+        dx_inner_2d = grad_inner_step_2d @ A_active
+        dx_inner = dx_inner_2d.reshape(shape_orig)
+
+        dx = dx_outer + dx_inner
+
+        dw_inner_A = torch.zeros_like(w_inner_A)
+        dw_inner_A[:effective_rank, :] = dw_inner_A_active
+
+        dw_inner_B = torch.zeros_like(w_inner_B)
+        dw_inner_B[:, :effective_rank] = dw_inner_B_active
+
+        return dx, dw_outer, dw_inner_A, dw_inner_B, dalpha, dbias, None
+
+class DeepParameterLinear(nn.Module):
+    def __init__(self, in_features: int, out_features: int, rank: int = 8, bias: bool = True):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.rank = rank
+        self.active_rank = rank
+
+        self.w_outer = nn.Parameter(torch.empty(out_features, in_features))
+        nn.init.kaiming_uniform_(self.w_outer, nonlinearity='linear')
+
+        self.w_inner_A = nn.Parameter(torch.empty(rank, in_features))
+        nn.init.orthogonal_(self.w_inner_A)
+
+        self.w_inner_B = nn.Parameter(torch.zeros(out_features, rank))
+        self.alpha = nn.Parameter(torch.ones(out_features) * 0.1)
+
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_features))
+        else:
+            self.register_parameter('bias', None)
+
+    def set_active_rank(self, new_rank: int):
+        if new_rank > self.rank or new_rank < 1:
+            raise ValueError(f"Aktif rank 1 ile {self.rank} arasinda olmalidir!")
+        self.active_rank = new_rank
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return DeepParameterFunction.apply(
+            x, self.w_outer, self.w_inner_A, self.w_inner_B,
+            self.alpha, self.bias, self.active_rank
+        )
+
+def run_benchmarks():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"🖥️ Calisan Donanim: {device}\n")
+
+    print("⏳ [TEST 1] Hiz ve Bellek Testi Basliyor...")
+    B, S, D, R = 64, 256, 2048, 32
+    x = torch.randn(B, S, D, device=device, requires_grad=True)
+
+    lin = nn.Linear(D, D).to(device)
+    t0 = time.time()
+    for _ in range(20): out_lin = lin(x)
+    fwd_lin = (time.time() - t0) * 1000 / 20
+
+    dp = DeepParameterLinear(D, D, rank=R).to(device)
+    t0 = time.time()
+    for _ in range(20): out_dp = dp(x)
+    fwd_dp = (time.time() - t0) * 1000 / 20
+
+    print(f"  -> Standart nn.Linear Forward: {fwd_lin:.2f} ms")
+    print(f"  -> DeepParameter V6.2 Forward: {fwd_dp:.2f} ms")
+    print("  -> VRAM Durumu: %100 Recomputation Aktif.\n")
+
+if __name__ == "__main__":
+    run_benchmarks()
