@@ -1,0 +1,170 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.autograd.function import once_differentiable
+
+MOD_CLAMP = 10.0
+
+
+class DeepParameterFunction(torch.autograd.Function):
+    """
+    y = (x @ W_outer^T) * clamp(1 + (alpha / r) * tanh(x @ A^T @ B^T), -10, 10) + bias
+    """
+
+    @staticmethod
+    @torch.amp.custom_fwd(device_type="cuda", cast_inputs=torch.float32)
+    def forward(ctx, x, w_outer, w_inner_A, w_inner_B, alpha, bias, rank, sanitize=True):
+        if sanitize:
+            x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0)
+
+        r = max(1, min(int(rank), w_inner_A.size(0)))
+        ctx.effective_rank = r
+        ctx.sanitize = sanitize
+
+        A = w_inner_A[:r, :]
+        B = w_inner_B[:, :r]
+
+        inner_step = F.linear(x, A)
+        inner_context = torch.tanh(F.linear(inner_step, B))
+        base_output = F.linear(x, w_outer)
+
+        raw_mod = 1.0 + (alpha / r) * inner_context
+        modulation = raw_mod.clamp(-MOD_CLAMP, MOD_CLAMP)
+
+        output = base_output * modulation
+        if bias is not None:
+            output = output + bias
+
+        ctx.save_for_backward(x, w_outer, w_inner_A, w_inner_B, alpha)
+        return output
+
+    @staticmethod
+    @once_differentiable
+    @torch.amp.custom_bwd(device_type="cuda")
+    def backward(ctx, grad_output):
+        x, w_outer, w_inner_A, w_inner_B, alpha = ctx.saved_tensors
+        r = ctx.effective_rank
+        need_x, need_wo, need_A, need_B, need_alpha, need_bias = ctx.needs_input_grad[:6]
+
+        if not any((need_x, need_wo, need_A, need_B, need_alpha, need_bias)):
+            return (None,) * 8
+
+        if ctx.sanitize:
+            grad_output = torch.nan_to_num(grad_output, nan=0.0)
+
+        in_features = x.shape[-1]
+        out_features = grad_output.shape[-1]
+        x_2d = x.reshape(-1, in_features)
+        g_2d = grad_output.reshape(-1, out_features)
+
+        dx = dw_outer = dA = dB = dalpha = dbias = None
+
+        if need_bias:
+            dbias = g_2d.sum(dim=0)
+
+        need_mod_path = need_x or need_A or need_B or need_alpha
+        need_modulation = need_x or need_wo
+
+        scaling = alpha / r
+        A = w_inner_A[:r, :]
+        B = w_inner_B[:, :r]
+
+        # Forward'daki ara tensorler saklanmadı, bellek için burada yeniden hesaplanıyor.
+        inner_step = F.linear(x_2d, A)
+        inner_context = torch.tanh(F.linear(inner_step, B))
+        raw_mod = 1.0 + scaling * inner_context
+
+        if need_modulation:
+            modulation = raw_mod.clamp(-MOD_CLAMP, MOD_CLAMP)
+            grad_base = g_2d * modulation
+            if need_wo:
+                dw_outer = grad_base.t() @ x_2d
+            if need_x:
+                dx = grad_base @ w_outer
+
+        if need_mod_path:
+            base_output = F.linear(x_2d, w_outer)
+            grad_mod = g_2d * base_output
+            # clamp'in saturasyon bölgesinde gradyan akmaz
+            in_range = (raw_mod >= -MOD_CLAMP) & (raw_mod <= MOD_CLAMP)
+            grad_mod = grad_mod.masked_fill(~in_range, 0.0)
+
+            if need_alpha:
+                dalpha = (grad_mod * inner_context).sum(dim=0) / r
+
+            grad_tanh_in = grad_mod * scaling * (1.0 - inner_context.pow(2))
+
+            if need_B:
+                dB_active = grad_tanh_in.t() @ inner_step
+                if r == w_inner_B.size(1):
+                    dB = dB_active
+                else:
+                    dB = torch.zeros_like(w_inner_B)
+                    dB[:, :r] = dB_active
+
+            if need_A or need_x:
+                grad_inner_step = grad_tanh_in @ B
+                if need_A:
+                    dA_active = grad_inner_step.t() @ x_2d
+                    if r == w_inner_A.size(0):
+                        dA = dA_active
+                    else:
+                        dA = torch.zeros_like(w_inner_A)
+                        dA[:r, :] = dA_active
+                if need_x:
+                    dx_inner = grad_inner_step @ A
+                    dx = dx_inner if dx is None else dx + dx_inner
+
+        if dx is not None:
+            dx = dx.reshape(x.shape)
+
+        # forward argümanları: x, w_outer, A, B, alpha, bias, rank, sanitize
+        return dx, dw_outer, dA, dB, dalpha, dbias, None, None
+
+
+class DeepParameterLinear(nn.Module):
+    def __init__(self, in_features: int, out_features: int, rank: int = 8,
+                 bias: bool = True, sanitize: bool = True, device=None, dtype=None):
+        super().__init__()
+        if rank < 1:
+            raise ValueError("rank >= 1 olmali")
+        factory = {"device": device, "dtype": dtype}
+        self.in_features = in_features
+        self.out_features = out_features
+        self.rank = rank
+        self.active_rank = rank
+        self.sanitize = sanitize
+
+        self.w_outer = nn.Parameter(torch.empty(out_features, in_features, **factory))
+        self.w_inner_A = nn.Parameter(torch.empty(rank, in_features, **factory))
+        self.w_inner_B = nn.Parameter(torch.empty(out_features, rank, **factory))
+        self.alpha = nn.Parameter(torch.empty(out_features, **factory))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features, **factory))
+        else:
+            self.register_parameter("bias", None)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.w_outer, nonlinearity="linear")
+        nn.init.orthogonal_(self.w_inner_A)
+        nn.init.zeros_(self.w_inner_B)
+        nn.init.constant_(self.alpha, 0.1)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+
+    def set_active_rank(self, new_rank: int):
+        if new_rank > self.rank or new_rank < 1:
+            raise ValueError(f"Aktif rank 1 ile {self.rank} arasinda olmalidir!")
+        self.active_rank = new_rank
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return DeepParameterFunction.apply(
+            x, self.w_outer, self.w_inner_A, self.w_inner_B,
+            self.alpha, self.bias, self.active_rank, self.sanitize,
+        )
+
+    def extra_repr(self) -> str:
+        return (f"in_features={self.in_features}, out_features={self.out_features}, "
+                f"rank={self.rank}, active_rank={self.active_rank}, "
+                f"bias={self.bias is not None}, sanitize={self.sanitize}")
